@@ -3,13 +3,14 @@
 
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
+import { createSupabaseClient } from '@/lib/supabaseClient'
 
 interface Asset {
   id: string
   name: string
+  category_id: string
+  department_id: string
   description: string
-  category_id: string | null
-  department_id: string | null
   created_at: string
 }
 
@@ -23,13 +24,6 @@ interface Department {
   name: string
 }
 
-interface FormData {
-  name: string
-  description: string
-  category_id: string
-  department_id: string
-}
-
 export default function AdminAssetsPage() {
   const [assets, setAssets] = useState<Asset[]>([])
   const [categories, setCategories] = useState<Category[]>([])
@@ -38,69 +32,108 @@ export default function AdminAssetsPage() {
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState('')
   const [showModal, setShowModal] = useState(false)
-  const [formData, setFormData] = useState<FormData>({
+  const [formData, setFormData] = useState({
     name: '',
-    description: '',
     category_id: '',
-    department_id: ''
+    department_id: '',
+    description: ''
   })
 
+  // recommended: keep auth state in component
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null)
+
+  const supabase = createSupabaseClient()
+
   useEffect(() => {
-    fetchAllData()
+    fetchData()
   }, [])
 
-  async function fetchAllData() {
+  // set and listen for auth state (keeps UI aware of sign-in/sign-out)
+  useEffect(() => {
+    async function loadUser() {
+      try {
+        const { data: sessionData } = await supabase.auth.getSession()
+        if (sessionData?.session) setCurrentUserId(sessionData.session.user.id)
+      } catch (err) {
+        console.error('Error getting session on mount', err)
+      }
+    }
+    loadUser()
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) setCurrentUserId(session.user.id)
+      else setCurrentUserId(null)
+    })
+
+    return () => {
+      // unsubscribe listener on unmount
+      try {
+        listener.subscription.unsubscribe()
+      } catch (e) {
+        // ignore unsubscribe error
+      }
+    }
+  }, [supabase])
+
+  async function fetchData() {
     try {
       setLoading(true)
       setError('')
+
       const [assetsRes, categoriesRes, departmentsRes] = await Promise.all([
-        fetch('/api/admin/assets'),
-        fetch('/api/admin/categories'),
-        fetch('/api/admin/departments')
+        supabase.from('assets').select('*').order('created_at', { ascending: false }),
+        supabase.from('categories').select('id, name'),
+        supabase.from('departments').select('id, name')
       ])
 
-      if (!assetsRes.ok || !categoriesRes.ok || !departmentsRes.ok) {
-        throw new Error('Failed to fetch data')
-      }
+      if (assetsRes.error) throw assetsRes.error
+      if (categoriesRes.error) throw categoriesRes.error
+      if (departmentsRes.error) throw departmentsRes.error
 
-      const assetsData = await assetsRes.json()
-      const categoriesData = await categoriesRes.json()
-      const departmentsData = await departmentsRes.json()
-
-      setAssets(Array.isArray(assetsData) ? assetsData : [])
-      setCategories(Array.isArray(categoriesData) ? categoriesData : [])
-      setDepartments(Array.isArray(departmentsData) ? departmentsData : [])
+      setAssets(assetsRes.data || [])
+      setCategories(categoriesRes.data || [])
+      setDepartments(departmentsRes.data || [])
     } catch (err: any) {
-      setError(err?.message || 'Failed to fetch data')
+      setError(err.message || 'Failed to fetch data')
+      console.error('Error fetching data:', err)
     } finally {
       setLoading(false)
     }
   }
 
+  // recommended handleSubmit — uses currentUserId (set by auth listener)
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError('')
     setCreating(true)
 
     try {
-      const res = await fetch('/api/admin/assets', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      if (!currentUserId) {
+        setError('You must be signed in to create an asset.')
+        // redirect to auth page so user can sign in
+        window.location.href = '/auth'
+        return
+      }
+
+      const { error: insertError } = await supabase
+        .from('assets')
+        .insert({
           name: formData.name,
+          category_id: formData.category_id,
+          department_id: formData.department_id,
           description: formData.description,
-          category_id: formData.category_id || null,
-          department_id: formData.department_id || null
+          owner_id: currentUserId
         })
-      })
-      const body = await res.json()
-      if (!res.ok || body?.error) throw new Error(body?.error || 'Create failed')
-      await fetchAllData()
-      setFormData({ name: '', description: '', category_id: '', department_id: '' })
+
+      if (insertError) throw insertError
+
+      await fetchData()
+      setFormData({ name: '', category_id: '', department_id: '', description: '' })
       setShowModal(false)
       alert('Asset created successfully!')
     } catch (err: any) {
-      setError(err?.message || 'Failed to create asset')
+      setError(`Failed to create asset: ${err.message}`)
+      console.error('Error creating asset:', err)
     } finally {
       setCreating(false)
     }
@@ -110,17 +143,18 @@ export default function AdminAssetsPage() {
     if (!confirm('Are you sure you want to delete this asset?')) return
 
     try {
-      const res = await fetch('/api/admin/assets', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      })
-      const body = await res.json()
-      if (!res.ok || body?.error) throw new Error(body?.error || 'Delete failed')
-      await fetchAllData()
+      const { error: deleteError } = await supabase
+        .from('assets')
+        .delete()
+        .eq('id', id)
+
+      if (deleteError) throw deleteError
+
+      await fetchData()
       alert('Asset deleted successfully!')
     } catch (err: any) {
-      setError(err?.message || 'Failed to delete asset')
+      setError(err.message || 'Failed to delete asset')
+      console.error('Error deleting asset:', err)
     }
   }
 
@@ -187,18 +221,13 @@ export default function AdminAssetsPage() {
               Create and manage assets ({assets.length} {assets.length === 1 ? 'asset' : 'assets'})
             </p>
           </div>
-          <div className="flex gap-3">
-            <button onClick={() => fetchAllData()} disabled={loading} className="px-6 py-3 border-2 border-gray-300 text-gray-700 rounded-xl font-semibold hover:bg-gray-50" style={{ fontFamily: 'Poppins, sans-serif' }}>
-              Refresh
-            </button>
-            <button
-              onClick={() => setShowModal(true)}
-              className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl"
-              style={{ fontFamily: 'Poppins, sans-serif' }}
-            >
-              + Add New Asset
-            </button>
-          </div>
+          <button
+            onClick={() => setShowModal(true)}
+            className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl"
+            style={{ fontFamily: 'Poppins, sans-serif' }}
+          >
+            + Add New Asset
+          </button>
         </div>
 
         {loading ? (
@@ -225,10 +254,9 @@ export default function AdminAssetsPage() {
                   <thead className="bg-gradient-to-r from-blue-600 to-blue-500">
                     <tr>
                       <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Name</th>
-                      <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Description</th>
                       <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Category</th>
                       <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Department</th>
-                      <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Created</th>
+                      <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Description</th>
                       <th className="px-6 py-3 text-left text-white font-semibold" style={{ fontFamily: 'Poppins, sans-serif' }}>Actions</th>
                     </tr>
                   </thead>
@@ -239,10 +267,9 @@ export default function AdminAssetsPage() {
                       return (
                         <tr key={asset.id} className="hover:bg-gray-50">
                           <td className="px-6 py-4 text-gray-900" style={{ fontFamily: 'Poppins, sans-serif' }}>{asset.name}</td>
+                          <td className="px-6 py-4 text-gray-600" style={{ fontFamily: 'Poppins, sans-serif' }}>{cat?.name || 'N/A'}</td>
+                          <td className="px-6 py-4 text-gray-600" style={{ fontFamily: 'Poppins, sans-serif' }}>{dept?.name || 'N/A'}</td>
                           <td className="px-6 py-4 text-gray-600" style={{ fontFamily: 'Poppins, sans-serif' }}>{asset.description}</td>
-                          <td className="px-6 py-4 text-gray-600" style={{ fontFamily: 'Poppins, sans-serif' }}>{cat?.name || '—'}</td>
-                          <td className="px-6 py-4 text-gray-600" style={{ fontFamily: 'Poppins, sans-serif' }}>{dept?.name || '—'}</td>
-                          <td className="px-6 py-4 text-gray-600 text-sm">{new Date(asset.created_at).toLocaleDateString()}</td>
                           <td className="px-6 py-4">
                             <button
                               onClick={() => handleDelete(asset.id)}
@@ -266,7 +293,7 @@ export default function AdminAssetsPage() {
       {/* Add Asset Modal */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md">
             <div className="bg-gradient-to-r from-blue-600 to-blue-500 px-6 py-5">
               <h3 className="text-xl font-bold text-white" style={{ fontFamily: 'Poppins, sans-serif' }}>Add New Asset</h3>
             </div>
@@ -280,22 +307,9 @@ export default function AdminAssetsPage() {
                   required
                   value={formData.name}
                   onChange={(e) => setFormData({...formData, name: e.target.value})}
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
-                  style={{ fontFamily: 'Poppins, sans-serif' }}
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"
                   placeholder="e.g., Laptop"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2" style={{ fontFamily: 'Poppins, sans-serif' }}>
-                  Description
-                </label>
-                <textarea
-                  value={formData.description}
-                  onChange={(e) => setFormData({...formData, description: e.target.value})}
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
                   style={{ fontFamily: 'Poppins, sans-serif' }}
-                  placeholder="Brief description..."
-                  rows={2}
                 />
               </div>
               <div>
@@ -303,12 +317,13 @@ export default function AdminAssetsPage() {
                   Category
                 </label>
                 <select
+                  required
                   value={formData.category_id}
                   onChange={(e) => setFormData({...formData, category_id: e.target.value})}
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"
                   style={{ fontFamily: 'Poppins, sans-serif' }}
                 >
-                  <option value="">Select a category (optional)</option>
+                  <option value="">Select a category</option>
                   {categories.map(cat => (
                     <option key={cat.id} value={cat.id}>{cat.name}</option>
                   ))}
@@ -319,16 +334,30 @@ export default function AdminAssetsPage() {
                   Department
                 </label>
                 <select
+                  required
                   value={formData.department_id}
                   onChange={(e) => setFormData({...formData, department_id: e.target.value})}
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"
                   style={{ fontFamily: 'Poppins, sans-serif' }}
                 >
-                  <option value="">Select a department (optional)</option>
+                  <option value="">Select a department</option>
                   {departments.map(dept => (
                     <option key={dept.id} value={dept.id}>{dept.name}</option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2" style={{ fontFamily: 'Poppins, sans-serif' }}>
+                  Description
+                </label>
+                <textarea
+                  value={formData.description}
+                  onChange={(e) => setFormData({...formData, description: e.target.value})}
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"
+                  placeholder="Brief description..."
+                  rows={3}
+                  style={{ fontFamily: 'Poppins, sans-serif' }}
+                />
               </div>
               <div className="flex space-x-3 pt-4">
                 <button
@@ -342,7 +371,7 @@ export default function AdminAssetsPage() {
                 <button
                   type="submit"
                   disabled={creating}
-                  className="flex-1 px-4 py-3 bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-xl font-semibold shadow-lg hover:from-blue-700 hover:to-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex-1 px-4 py-3 bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-xl font-semibold disabled:opacity-50"
                   style={{ fontFamily: 'Poppins, sans-serif' }}
                 >
                   {creating ? 'Creating...' : 'Create Asset'}
